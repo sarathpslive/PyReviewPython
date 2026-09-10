@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     github_token: str | None = None
     gemini_api_key: str | None = None
     llm_provider: str = "gemini"
-    llm_model: str = "gemini-2.5-flash"
+    llm_model: str = "gemini-3.6-flash"
     prompt_guard_enabled: bool = False
     prompt_guard_min_match_hits: int = 1
     prompt_guard_block_on_error: bool = False

@@ -12,7 +12,7 @@ from agent.code_review_orchestrator import CodeReviewOrchestrator
 class ADKRuntime:
     project_id: str | None = None
     location: str = "us-central1"
-    model_name: str = "gemini-2.5-flash"
+    model_name: str = "gemini-3.6-flash"
     orchestrator: CodeReviewOrchestrator | None = None
     _agent: adk.Agent | None = field(default=None, init=False, repr=False)
 

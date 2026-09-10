@@ -18,6 +18,18 @@ _OWASP = {
         "A05:2025 Injection",
         "https://owasp.org/Top10/2025/A05_2025-Injection/",
     ),
+    "SEC004": (
+        "A05:2025 Injection",
+        "https://owasp.org/Top10/2025/A05_2025-Injection/",
+    ),
+    "SEC005": (
+        "A01:2025 Broken Access Control",
+        "https://owasp.org/Top10/2025/A01_2025-Broken_Access_Control/",
+    ),
+    "SUG001": (
+        "A05:2025 Security Misconfiguration",
+        "https://owasp.org/Top10/2025/A05_2025-Security_Misconfiguration/",
+    ),
     "SSR": (
         "A01:2025 Broken Access Control",
         "https://owasp.org/Top10/2025/A01_2025-Broken_Access_Control/",

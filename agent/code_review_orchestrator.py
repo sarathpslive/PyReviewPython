@@ -41,6 +41,7 @@ class CodeReviewOrchestrator:
         stream.emit("model_armor", "scan_started", {"status": "running", "scope": "code_and_review_context"})
         stream.emit("model_armor", "scan_completed", armor_result)
         stream.emit("orchestrator", "pipeline_started", {"mode": "repo" if repo_path else "snippet"})
+        stream.emit("github_mcp", "mcp_tool_available", {"server": "@modelcontextprotocol/server-github", "tools": ["get_file_contents", "create_pull_request_review", "add_issue_comment"]})
         stream.emit("repo_loader", "started", {"repo_path": repo_path, "language": language})
         self.memory.add(review_id, "system", "Review started", repo_path=repo_path, language=language)
 

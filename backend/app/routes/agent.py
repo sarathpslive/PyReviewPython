@@ -39,16 +39,43 @@ async def invoke_agent(
     }
 
 
+@router.get("/agent/evaluate/scenarios")
+async def get_evaluation_scenarios() -> dict[str, object]:
+    scenarios = AgentEvaluationService().list_scenarios()
+    return {
+        "status": "ok",
+        "docs_url": "https://adk.dev/evaluate/",
+        "count": len(scenarios),
+        "scenarios": scenarios,
+    }
+
+
 @router.post("/agent/evaluate")
 async def evaluate_agent(payload: dict[str, object]) -> dict[str, object]:
     prompt = str(payload.get("prompt", ""))
     code_snippet = str(payload.get("code_snippet", ""))
     expected_keywords = payload.get("expected_keywords", [])
+    expected_tools = payload.get("expected_tools")
+    scenario_id = payload.get("scenario_id")
+    expected_rules = payload.get("expected_rules")
+
     if not prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required")
     if not isinstance(expected_keywords, list):
         raise HTTPException(status_code=400, detail="expected_keywords must be a list")
-    return AgentEvaluationService().evaluate(prompt, code_snippet, [str(item) for item in expected_keywords])
+
+    parsed_tools = [str(item) for item in expected_tools] if isinstance(expected_tools, list) else None
+    parsed_rules = [str(item) for item in expected_rules] if isinstance(expected_rules, list) else None
+
+    return AgentEvaluationService().evaluate(
+        prompt=prompt,
+        code_snippet=code_snippet,
+        expected_keywords=[str(item) for item in expected_keywords],
+        expected_tools=parsed_tools,
+        scenario_id=str(scenario_id) if scenario_id else None,
+        expected_rules=parsed_rules,
+    )
+
 
 
 @router.post("/security/model-armor/check")

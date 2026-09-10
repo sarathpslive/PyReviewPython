@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from backend.app.config import get_settings
+from agent.github_mcp_service import get_github_mcp_service
 from agent.recommendation_history_store import get_recommendation_history_store
 from agent.review_tools import scan_python_source
 
@@ -27,6 +28,44 @@ class GitHubPRReviewService:
         self.timeout_seconds = timeout_seconds
         self.history_store = get_recommendation_history_store()
         self.settings = get_settings()
+        self.mcp_service = get_github_mcp_service()
+
+    async def find_open_pull_request(self, owner: str, repo: str, branch: str | None = None) -> dict[str, Any] | None:
+        """Finds an open PR for the given branch (or latest open PR for the repo)."""
+        token = self.settings.github_token
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "code-assist-pr-reviewer",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        async with httpx.AsyncClient(timeout=self.timeout_seconds, headers=headers) as client:
+            if branch:
+                # 1. Try owner:branch
+                prs, _ = await self._get_json(client, f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&head={owner}:{branch}")
+                if isinstance(prs, list) and prs:
+                    return prs[0]
+
+                # 2. Try just branch
+                prs, _ = await self._get_json(client, f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&head={branch}")
+                if isinstance(prs, list) and prs:
+                    return prs[0]
+                
+                # 3. Fetch recent open PRs and match branch
+                prs, _ = await self._get_json(client, f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&per_page=30")
+                if isinstance(prs, list):
+                    for pr in prs:
+                        if isinstance(pr, dict) and pr.get("head", {}).get("ref") == branch:
+                            return pr
+
+            # If no branch specified, or branch PR not found, find latest active PR for repo
+            prs, _ = await self._get_json(client, f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&sort=updated&direction=desc&per_page=1")
+            if isinstance(prs, list) and prs:
+                return prs[0]
+            
+            return None
 
     async def review_pull_request(self, request: GitHubPRReviewRequest) -> dict[str, Any]:
         token = self.settings.github_token
@@ -52,14 +91,29 @@ class GitHubPRReviewService:
             if pr_error:
                 return self._fallback(request, reason=f"Failed to fetch PR metadata: {pr_error}", findings=[])
 
-            files, files_error = await self._get_json(
-                client,
-                f"https://api.github.com/repos/{request.owner}/{request.repo}/pulls/{request.pull_number}/files",
-            )
-            if files_error:
-                return self._fallback(request, reason=f"Failed to fetch PR files: {files_error}", findings=[])
-            if not isinstance(files, list):
-                return self._fallback(request, reason="GitHub PR files response was not a list.", findings=[])
+            files = None
+            mcp_used = False
+            mcp_tool_used: str | None = None
+
+            if await self.mcp_service.is_available():
+                try:
+                    mcp_files = await self.mcp_service.get_pull_request_files(request.owner, request.repo, request.pull_number)
+                    if isinstance(mcp_files, list) and mcp_files:
+                        files = mcp_files
+                        mcp_used = True
+                        mcp_tool_used = "get_pull_request_files"
+                except Exception:
+                    pass
+
+            if files is None:
+                files, files_error = await self._get_json(
+                    client,
+                    f"https://api.github.com/repos/{request.owner}/{request.repo}/pulls/{request.pull_number}/files",
+                )
+                if files_error:
+                    return self._fallback(request, reason=f"Failed to fetch PR files: {files_error}", findings=[])
+                if not isinstance(files, list):
+                    return self._fallback(request, reason="GitHub PR files response was not a list.", findings=[])
 
             findings = self._scan_changed_python_lines(files)
             findings = findings[: max(1, request.max_findings)]
@@ -83,59 +137,162 @@ class GitHubPRReviewService:
             posted_review_id: int | None = None
             comment_error: str | None = None
             if not request.dry_run:
-                review_payload: dict[str, Any] = {
-                    "event": self._normalize_review_event(request.review_event),
-                    "body": comment_body,
-                    "comments": inline_comments,
-                }
-                head_sha = pr.get("head", {}).get("sha") if isinstance(pr, dict) else None
-                if head_sha:
-                    review_payload["commit_id"] = head_sha
-                posted_review, post_error = await self._post_json(
+                # Deduplication check: inspect existing comments on the PR to prevent duplicate comment spam
+                existing_comments_data, _ = await self._get_json(
                     client,
-                    f"https://api.github.com/repos/{request.owner}/{request.repo}/pulls/{request.pull_number}/reviews",
-                    review_payload,
+                    f"https://api.github.com/repos/{request.owner}/{request.repo}/issues/{request.pull_number}/comments",
                 )
-                if post_error:
-                    fallback_payload = {
-                        "body": comment_body,
-                    }
-                    _, fallback_post_error = await self._post_json(
+                matching_comments: list[dict[str, Any]] = []
+                if isinstance(existing_comments_data, list):
+                    for c in existing_comments_data:
+                        if isinstance(c, dict) and self._is_pyreview_comment(c.get("body", "")):
+                            matching_comments.append(c)
+
+                if matching_comments:
+                    # Update existing comment in place instead of creating duplicate comments
+                    primary = matching_comments[0]
+                    _, patch_error = await self._patch_json(
                         client,
-                        f"https://api.github.com/repos/{request.owner}/{request.repo}/issues/{request.pull_number}/comments",
-                        fallback_payload,
+                        f"https://api.github.com/repos/{request.owner}/{request.repo}/issues/comments/{primary['id']}",
+                        {"body": comment_body},
                     )
-                    if fallback_post_error:
-                        comment_error = post_error
-                    else:
+                    if not patch_error:
                         posted = True
-                        comment_error = (
-                            "Inline PR review failed; posted a regular PR comment instead. "
-                            f"Reason: {post_error}"
+                        posted_review_id = primary.get("id")
+                        # Delete any leftover duplicate comments from previous scans
+                        for dup in matching_comments[1:]:
+                            dup_id = dup.get("id")
+                            if dup_id:
+                                await self._delete(
+                                    client,
+                                    f"https://api.github.com/repos/{request.owner}/{request.repo}/issues/comments/{dup_id}",
+                                )
+                    else:
+                        comment_error = f"Failed to update existing PR comment: {patch_error}"
+
+                # If no existing comment was updated, attempt initial posting
+                if not posted:
+                    # First attempt: Post via GitHub MCP Server
+                    if await self.mcp_service.is_available():
+                        try:
+                            mcp_res = await self.mcp_service.create_pull_request_review(
+                                owner=request.owner,
+                                repo=request.repo,
+                                pull_number=request.pull_number,
+                                body=comment_body,
+                                event=self._normalize_review_event(request.review_event),
+                                comments=inline_comments,
+                            )
+                            posted = True
+                            mcp_used = True
+                            mcp_tool_used = "create_pull_request_review"
+                            if isinstance(mcp_res, dict) and "id" in mcp_res:
+                                posted_review_id = mcp_res["id"]
+                        except Exception as mcp_rev_err:
+                            try:
+                                # Fallback to MCP issue comment
+                                await self.mcp_service.add_issue_comment(
+                                    owner=request.owner,
+                                    repo=request.repo,
+                                    pull_number=request.pull_number,
+                                    body=comment_body,
+                                )
+                                posted = True
+                                mcp_used = True
+                                mcp_tool_used = "add_issue_comment"
+                                comment_error = f"MCP inline review fallback to issue comment: {mcp_rev_err}"
+                            except Exception as mcp_comment_err:
+                                comment_error = f"MCP post failed: {mcp_comment_err}. Trying direct REST API..."
+
+                    # Fallback to direct GitHub REST API if MCP did not post
+                    if not posted:
+                        review_payload: dict[str, Any] = {
+                            "event": self._normalize_review_event(request.review_event),
+                            "body": comment_body,
+                            "comments": inline_comments,
+                        }
+                        head_sha = pr.get("head", {}).get("sha") if isinstance(pr, dict) else None
+                        if head_sha:
+                            review_payload["commit_id"] = head_sha
+                        posted_review, post_error = await self._post_json(
+                            client,
+                            f"https://api.github.com/repos/{request.owner}/{request.repo}/pulls/{request.pull_number}/reviews",
+                            review_payload,
                         )
-                elif isinstance(posted_review, dict):
-                    posted_review_id = posted_review.get("id")
-                    posted = True
-                else:
-                    posted = True
+                        if post_error:
+                            fallback_payload = {
+                                "body": comment_body,
+                            }
+                            posted_comm, fallback_post_error = await self._post_json(
+                                client,
+                                f"https://api.github.com/repos/{request.owner}/{request.repo}/issues/{request.pull_number}/comments",
+                                fallback_payload,
+                            )
+                            if fallback_post_error:
+                                comment_error = post_error
+                            else:
+                                posted = True
+                                if isinstance(posted_comm, dict):
+                                    posted_review_id = posted_comm.get("id")
+                                comment_error = (
+                                    "Inline PR review failed; posted a regular PR comment instead. "
+                                    f"Reason: {post_error}"
+                                )
+                        elif isinstance(posted_review, dict):
+                            posted_review_id = posted_review.get("id")
+                            posted = True
+                        else:
+                            posted = True
             
             event_used = self._normalize_review_event(request.review_event)
 
+            # Collect source files from PR head commit for multi-file code display in the UI
+            pr_files: list[dict[str, str]] = []
+            head_sha = pr.get("head", {}).get("sha") if isinstance(pr, dict) else None
+            if isinstance(files, list):
+                for file_item in files:
+                    if not isinstance(file_item, dict):
+                        continue
+                    fname = str(file_item.get("filename", ""))
+                    if not fname.endswith(".py"):
+                        continue
+                    file_content = None
+                    if head_sha:
+                        try:
+                            from agent.github_url_resolver import _fetch_via_github_api
+                            file_content = await _fetch_via_github_api(client, request.owner, request.repo, fname, ref=head_sha)
+                        except Exception:
+                            file_content = None
+                    if not file_content:
+                        patch_text = file_item.get("patch", "")
+                        lines = [l[1:] for l in patch_text.splitlines() if l.startswith("+") and not l.startswith("+++")]
+                        file_content = "\n".join(lines) if lines else "# No content available"
+                    pr_files.append({
+                        "path": fname,
+                        "name": fname.split("/")[-1],
+                        "code": file_content,
+                    })
+
+        pr_url = f"https://github.com/{request.owner}/{request.repo}/pull/{request.pull_number}"
         return {
             "status": "ok" if posted or request.dry_run else "partial",
             "mode": "dry_run" if request.dry_run else "live",
             "owner": request.owner,
             "repo": request.repo,
             "pull_number": request.pull_number,
+            "pr_url": pr_url,
             "pr_title": pr.get("title") if isinstance(pr, dict) else None,
             "total_findings": len(findings),
             "findings": findings,
+            "files": pr_files,
             "review_event": event_used,
             "inline_comments_count": len(inline_comments),
             "history_rows_added": history_rows_added,
             "review_submitted": posted,
             "review_id": posted_review_id,
             "comment_posted": posted,
+            "mcp_used": mcp_used,
+            "mcp_tool": mcp_tool_used,
             "fallback_used": bool(comment_error),
             "fallback_reason": comment_error,
             "fallback_comment_preview": comment_body if comment_error else None,
@@ -156,6 +313,22 @@ class GitHubPRReviewService:
             return response.json(), None
         except Exception as exc:
             return None, str(exc)
+
+    async def _patch_json(self, client: httpx.AsyncClient, url: str, payload: dict[str, Any]) -> tuple[Any, str | None]:
+        try:
+            response = await client.patch(url, json=payload)
+            response.raise_for_status()
+            return response.json(), None
+        except Exception as exc:
+            return None, str(exc)
+
+    async def _delete(self, client: httpx.AsyncClient, url: str) -> tuple[bool, str | None]:
+        try:
+            response = await client.delete(url)
+            response.raise_for_status()
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
 
     def _normalize_review_event(self, value: str) -> str:
         event = (value or "COMMENT").strip().upper()
@@ -264,7 +437,18 @@ class GitHubPRReviewService:
 
         return added
 
+    def _is_pyreview_comment(self, comment_body: str) -> bool:
+        if not comment_body:
+            return False
+        return (
+            "<!-- pyreview-pr-comment -->" in comment_body
+            or "Automated Peer Review" in comment_body
+            or "Deterministic scan of changed Python lines" in comment_body
+            or "code review assistant with graceful fallback enabled" in comment_body
+        )
+
     def _build_comment_body(self, findings: list[dict[str, Any]], review_body: str | None = None) -> str:
+        marker = "<!-- pyreview-pr-comment -->\n"
         if review_body and review_body.strip():
             prefix = review_body.strip()
         else:
@@ -272,12 +456,14 @@ class GitHubPRReviewService:
 
         if not findings:
             return (
+                f"{marker}"
                 f"{prefix}\n\n"
                 "No deterministic issues were detected in changed Python lines.\n"
                 "Review scope: changed `.py` lines from this PR only."
             )
 
         lines = [
+            marker,
             prefix,
             "",
             "Deterministic scan of changed Python lines found the following:",

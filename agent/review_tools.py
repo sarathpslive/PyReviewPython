@@ -64,11 +64,10 @@ def _python_ast_issues(source: str) -> list[dict[str, Any]]:
         # Keep scanning lexically so partial diffs / long incomplete snippets still report security signals.
         return [syntax_issue, *_lexical_fallback_issues(source)]
 
+    # Generic dangerous calls (non-subprocess; subprocess is handled precisely by SEC004)
     suspicious_calls = {
         "eval": "Avoid dynamic execution; prefer explicit parsing or safe APIs.",
         "exec": "Avoid runtime code execution from untrusted input.",
-        "subprocess.run": "Validate the command input and consider restricting subprocess access.",
-        "subprocess.Popen": "Validate the command input and consider restricting subprocess access.",
         "pickle.loads": "Deserialization from untrusted input can lead to code execution.",
         "yaml.load": "Use safe loaders like yaml.safe_load instead of yaml.load.",
         "requests.get": "Ensure outbound requests are constrained and validated. Consider timeouts.",
@@ -88,57 +87,178 @@ def _python_ast_issues(source: str) -> list[dict[str, Any]]:
                     "evidence": func_name,
                 })
 
-    sql_fstring_variables: set[str] = set()
-    sql_injection_issues: list[dict[str, Any]] = []
-    
+    # -----------------------------------------------------------------
+    # SEC004: Command Injection via subprocess / os.system with shell=True
+    #         or dynamic command string formatting.
+    # -----------------------------------------------------------------
+    _SUBPROCESS_FUNCS = {
+        "subprocess.run",
+        "subprocess.Popen",
+        "subprocess.check_output",
+        "subprocess.check_call",
+        "subprocess.call",
+        "os.system",
+        "os.popen",
+    }
+
     for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = _call_name(node.func)
+        if func_name not in _SUBPROCESS_FUNCS:
+            continue
+
+        # Check for shell=True keyword
+        has_shell_true = any(
+            isinstance(kw, ast.keyword) and kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+            for kw in node.keywords
+        )
+
+        # Check whether the command argument is dynamically constructed (f-string or Name)
+        cmd_arg = node.args[0] if node.args else None
+        cmd_is_dynamic = isinstance(cmd_arg, (ast.JoinedStr, ast.BinOp, ast.Call))
+
+        if has_shell_true or cmd_is_dynamic:
+            func_short = func_name.split(".")[-1]
+            issues.append({
+                "line": getattr(node, "lineno", 1),
+                "severity": "critical",
+                "rule_id": "SEC004",
+                "category": "security",
+                "message": (
+                    "Command Injection: subprocess called with shell=True and a dynamic command string. "
+                    "An attacker can append arbitrary shell commands using ;, &&, or | operators."
+                ),
+                "recommendation": (
+                    "Pass the command as a list of arguments and remove shell=True so the OS never "
+                    "invokes a shell interpreter. Validate and whitelist every element of user input."
+                ),
+                "evidence": f"{func_name}(..., shell=True)" if has_shell_true else f"{func_name}(f\"...\", ...)",
+                "replacement": (
+                    f"# Pass command as a list — no shell interpreter invoked\n"
+                    f"output = subprocess.check_output([\"ping\", \"-c\", \"1\", host_input], text=True)"
+                    if func_short in ("check_output",)
+                    else (
+                        f"# Pass command as a list — no shell interpreter invoked\n"
+                        f"result = subprocess.run([\"your_cmd\", arg1, arg2], capture_output=True, text=True, check=True)"
+                    )
+                ),
+            })
+
+    # -----------------------------------------------------------------
+    # SEC003: SQL Injection — detect f-string SQL assignment and execute()
+    # Produce ONE consolidated finding per query: prefer the execute() line
+    # so the finding points at the actual injection site with a targeted fix.
+    # -----------------------------------------------------------------
+    sql_fstring_variables: dict[str, dict] = {}   # var_name -> preliminary finding dict
+    sql_injection_issues: list[dict[str, Any]] = []
+    sql_reported_vars: set[str] = set()           # vars already surfaced via execute()
+
+    for node in ast.walk(tree):
+        # Step 1: detect SQL f-string assignments
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.JoinedStr):
             target_names = [target.id for target in node.targets if isinstance(target, ast.Name)]
             sql_text = "".join(item.value for item in node.value.values if isinstance(item, ast.Constant)).lower()
             has_sql_keyword = any(keyword in sql_text for keyword in ("select ", "insert ", "update ", "delete "))
-            
-            # Check if f-string has interpolation (FormattedValue nodes = {} parts)
             has_interpolation = any(isinstance(item, ast.FormattedValue) for item in node.value.values)
-            
-            if has_sql_keyword:
-                sql_fstring_variables.update(target_names)
-                
-                # NEW: Flag SQL f-strings with interpolation directly (don't need execute() call)
-                if has_interpolation:
-                    sql_injection_issues.append({
-                        "line": getattr(node, "lineno", 1),
-                        "severity": "critical",
-                        "rule_id": "SEC003",
-                        "category": "security",
-                        "message": "SQL query is built with string formatting or interpolation.",
-                        "recommendation": "Use parameterized SQL queries and pass user values as bound parameters instead of interpolating them into SQL syntax.",
-                        "evidence": "SQL f-string with variable interpolation",
-                        "replacement": (
-                            "query = \"SELECT * FROM users WHERE id = ?\"\n"
-                            "cursor.execute(query, (user_id,))"
-                        ),
-                    })
 
+            if has_sql_keyword and has_interpolation:
+                preliminary = {
+                    "line": getattr(node, "lineno", 1),
+                    "severity": "critical",
+                    "rule_id": "SEC003",
+                    "category": "security",
+                    "message": "SQL Injection: SQL query built with string interpolation — user input is embedded directly into the query.",
+                    "recommendation": "Use parameterized queries. Pass user values as bound parameters, never via string formatting.",
+                    "evidence": "SQL f-string with variable interpolation",
+                    "replacement": (
+                        "# Safe parameterized query — user input is treated as data, not SQL\n"
+                        "cursor.execute(\"SELECT * FROM users WHERE username = ?\", (username,))"
+                    ),
+                }
+                for name in target_names:
+                    sql_fstring_variables[name] = preliminary
+
+        # Step 2: when execute() is called with a tainted variable, upgrade to execute-site finding
         if isinstance(node, ast.Call) and _call_name(node.func).split(".")[-1] in {"execute", "executemany"}:
             query_argument = node.args[0] if node.args else None
-            is_formatted_sql = isinstance(query_argument, ast.JoinedStr)
-            is_tainted_sql = isinstance(query_argument, ast.Name) and query_argument.id in sql_fstring_variables
-            if is_formatted_sql or is_tainted_sql:
+
+            # Direct f-string in execute()
+            if isinstance(query_argument, ast.JoinedStr):
                 sql_injection_issues.append({
                     "line": getattr(node, "lineno", 1),
                     "severity": "critical",
                     "rule_id": "SEC003",
                     "category": "security",
-                    "message": "SQL query is built with string formatting or interpolation.",
-                    "recommendation": "Use parameterized SQL queries and pass user values as bound parameters instead of interpolating them into SQL syntax.",
-                    "evidence": "SQL interpolation in execute() call",
+                    "message": "SQL Injection: SQL query built with f-string interpolation passed directly to cursor.execute().",
+                    "recommendation": "Use parameterized queries. Pass user values as bound parameters, never via string formatting.",
+                    "evidence": "f-string SQL passed to execute()",
                     "replacement": (
-                        "query = \"SELECT * FROM users WHERE username = ? AND password = ?\"\n"
-                        "cursor.execute(query, (username, password))"
+                        "# Safe parameterized query — user input is treated as data, not SQL\n"
+                        "cursor.execute(\"SELECT * FROM users WHERE username = ?\", (username,))"
                     ),
                 })
-    
+
+            # Tainted variable passed to execute()
+            elif isinstance(query_argument, ast.Name) and query_argument.id in sql_fstring_variables:
+                var_name = query_argument.id
+                preliminary = sql_fstring_variables[var_name]
+                sql_reported_vars.add(var_name)
+                sql_injection_issues.append({
+                    **preliminary,
+                    "line": getattr(node, "lineno", 1),
+                    "evidence": f"Tainted variable `{var_name}` (SQL f-string from line {preliminary['line']}) passed to execute()",
+                    "replacement": (
+                        "# Safe parameterized query — user input is treated as data, not SQL\n"
+                        "cursor.execute(\"SELECT * FROM users WHERE username = ?\", (username,))"
+                    ),
+                })
+
+    # Add any un-consumed preliminary findings (f-string SQL not fed to execute())
+    for var_name, finding in sql_fstring_variables.items():
+        if var_name not in sql_reported_vars:
+            sql_injection_issues.append(finding)
+
     issues.extend(sql_injection_issues)
+
+    # -----------------------------------------------------------------
+    # SEC005: Path Traversal — os.path.join / open / Path() with tainted argument
+    # -----------------------------------------------------------------
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = _call_name(node.func)
+
+        # Detect os.path.join(base_dir, user_input) without os.path.basename sanitization
+        if func_name in {"os.path.join", "os.path.normpath"}:
+            # Flag if any argument is a Name (variable) that could be user-controlled
+            non_literal_args = [a for a in node.args if not isinstance(a, ast.Constant)]
+            if len(non_literal_args) >= 1:
+                issues.append({
+                    "line": getattr(node, "lineno", 1),
+                    "severity": "critical",
+                    "rule_id": "SEC005",
+                    "category": "security",
+                    "message": (
+                        "Path Traversal: User-controlled input is passed to os.path.join() without sanitization. "
+                        "An attacker can escape the intended base directory using sequences like ../../etc/passwd."
+                    ),
+                    "recommendation": (
+                        "Sanitize the filename with os.path.basename() to strip any directory components, "
+                        "then verify the resolved path is still within the intended base directory using os.path.abspath()."
+                    ),
+                    "evidence": f"{func_name}(base_dir, filename)",
+                    "replacement": (
+                        "import os\n"
+                        "safe_name = os.path.basename(filename)  # strip any ../ traversal\n"
+                        "filepath = os.path.join(base_dir, safe_name)\n"
+                        "# Verify path stays inside base_dir\n"
+                        "if not os.path.abspath(filepath).startswith(os.path.abspath(base_dir)):\n"
+                        "    raise ValueError('Invalid file path')"
+                    ),
+                })
+
+
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -183,6 +303,103 @@ def _python_ast_issues(source: str) -> list[dict[str, Any]]:
             })
 
     issues.extend(_business_logic_ast_issues(tree, source))
+    issues.extend(_quality_suggestion_issues(tree, source))
+
+    return issues
+
+
+def _quality_suggestion_issues(tree: ast.AST, source: str) -> list[dict[str, Any]]:
+    """Non-blocking code quality suggestions (SUG-series rules)."""
+    issues: list[dict[str, Any]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+
+        func_body_lines = ast.get_source_segment(source, node) or ""
+        func_lower = func_body_lines.lower()
+
+        # -----------------------------------------------------------------
+        # SUG001: DB connection not using context manager (with statement)
+        # -----------------------------------------------------------------
+        has_db_connect = ".connect(" in func_lower
+        has_context_manager = "with " in func_lower and ".connect(" in func_lower
+        has_close_call = ".close()" in func_lower
+
+        if has_db_connect and not has_context_manager and has_close_call:
+            issues.append({
+                "line": getattr(node, "lineno", 1),
+                "severity": "minor",
+                "rule_id": "SUG001",
+                "category": "quality",
+                "message": (
+                    "Suggestion: Database connection managed manually with .close() instead of a context manager. "
+                    "Manual close() can be skipped if an exception is raised, leaking the connection."
+                ),
+                "recommendation": (
+                    "Use `with sqlite3.connect(...) as conn:` so the connection is always closed, "
+                    "even if an exception is raised mid-function."
+                ),
+                "evidence": ".close()",
+                "replacement": (
+                    "# Context manager ensures connection is always closed\n"
+                    "with sqlite3.connect('users.db') as conn:\n"
+                    "    cursor = conn.cursor()\n"
+                    "    cursor.execute(\"SELECT * FROM users WHERE username = ?\", (username,))\n"
+                    "    return cursor.fetchall()"
+                ),
+            })
+
+        # -----------------------------------------------------------------
+        # SUG002: Function lacks return type annotation
+        # -----------------------------------------------------------------
+        if node.returns is None:
+            issues.append({
+                "line": getattr(node, "lineno", 1),
+                "severity": "info",
+                "rule_id": "SUG002",
+                "category": "quality",
+                "message": f"Suggestion: Function `{node.name}` is missing a return type annotation.",
+                "recommendation": (
+                    "Add a return type annotation (e.g. `-> list[dict]` or `-> str`) to improve readability, "
+                    "IDE support, and runtime type checking."
+                ),
+                "evidence": f"def {node.name}(...)",
+                "replacement": f"def {node.name}(...) -> <return_type>:",
+            })
+
+        # -----------------------------------------------------------------
+        # SUG003: subprocess or network call without input validation
+        # -----------------------------------------------------------------
+        has_subprocess = any(
+            isinstance(child, ast.Call) and _call_name(child.func).startswith("subprocess.")
+            for child in ast.walk(node)
+        )
+        # Heuristic: no isinstance/regex/if-guard before the subprocess call
+        has_validation = "isinstance(" in func_lower or "re." in func_lower or "validate" in func_lower
+        if has_subprocess and not has_validation:
+            issues.append({
+                "line": getattr(node, "lineno", 1),
+                "severity": "minor",
+                "rule_id": "SUG003",
+                "category": "quality",
+                "message": (
+                    f"Suggestion: Function `{node.name}` invokes a subprocess without apparent input validation. "
+                    "Validate and sanitize arguments before passing them to system calls."
+                ),
+                "recommendation": (
+                    "Validate the input (e.g. with a regex whitelist for IP addresses or hostnames) "
+                    "and raise an exception if the input does not match expected patterns."
+                ),
+                "evidence": "subprocess call with unvalidated argument",
+                "replacement": (
+                    "import re\n"
+                    "# Whitelist: allow only valid IPv4 or hostname\n"
+                    "if not re.match(r'^[a-zA-Z0-9._-]+$', host_input):\n"
+                    "    raise ValueError(f'Invalid host: {host_input!r}')\n"
+                    "output = subprocess.check_output([\"ping\", \"-c\", \"1\", host_input], text=True)"
+                ),
+            })
 
     return issues
 
@@ -430,13 +647,20 @@ def _normalize_severity(
     # 1. Explicit security rules from our AST/security scanner
     # ---------------------------------------------------------
     security_critical_rules = {
-        "SEC003",  # SQL injection
-        "SEC002",  # Hardcoded secret
         "SEC001",  # Dangerous calls
+        "SEC002",  # Hardcoded secret
+        "SEC003",  # SQL injection
+        "SEC004",  # Command injection
+        "SEC005",  # Path traversal
     }
 
     if code_name in security_critical_rules:
         return "critical"
+
+    # SUG-series rules are always non-blocking suggestions or informational
+    if code_name.startswith("SUG"):
+        # SUG002 is purely informational (missing type annotations)
+        return "info" if code_name == "SUG002" else "minor"
 
     # ---------------------------------------------------------
     # 2. Security indicators from scanner messages
